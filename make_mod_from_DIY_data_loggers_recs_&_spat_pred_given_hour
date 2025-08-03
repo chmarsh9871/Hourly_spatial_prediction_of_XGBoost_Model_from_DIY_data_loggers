@@ -1,0 +1,392 @@
+
+#rm(list = ls())
+#gc()
+
+#remove(predicted_raster)
+#remove(predictions)
+
+install.packages("xgboost")
+install.packages("raster")
+install.packages("terra")
+install.packages("dplyr") 
+install.packages("plantecophys")
+library(plantecophys)
+library(xgboost)
+library(raster)
+library(terra)
+library(dplyr)
+
+DLs_4 <- read.csv("F:/Marsh/DLs_4.csv")
+DLs_4$DEM_ELE <- NULL
+Topo_vals <- read.csv("F:/Marsh/DLs_unique_topo_indices_valsAA.csv")
+
+merged_df <- merge(DLs_4, Topo_vals, by = "Site_DL", all.x = TRUE)
+
+merged_df$VPD <- RHtoVPD(merged_df$rH, merged_df$TempC)
+
+data.frame(colnames(merged_df))
+nrow(merged_df)
+unique(merged_df$Site_DL)
+
+train_indices <- sample(seq_len(nrow(merged_df)), size = 0.8 * nrow(merged_df))
+train_df <- merged_df[train_indices, ]
+test_df  <- merged_df[-train_indices, ]
+nrow(test_df)
+###
+
+# Specify feature and target columns
+feature_cols <- c(20,30:41,44,47,51,52,53:60)
+target_cols <- c(61)
+
+# Define XGBoost parameters
+params <- list(
+  objective = "reg:squarederror",  # Regression problem
+  booster = "gbtree",
+  eta = 0.075,                      # Learning rate
+  max_depth = 5,                   # Equivalent to tree complexity in gbm.step
+  subsample = 0.8,                 # Similar to bag.fraction
+  colsample_bytree = 0.8,# Fraction of features used per tree
+  eval_metric = "rmse")             # Root Mean Squared Error for evaluation
+
+
+# Function to train model and generate results for a single target column
+
+
+# Create training matrix
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_df[, feature_cols]),  # Select only feature columns
+  label = train_df[, target_cols])
+
+# Create test matrix
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_df[, feature_cols]),  # Select only feature columns
+  label = test_df[, target_cols]              # Use specified column as the target
+)
+
+# Train the model with early stopping
+
+VPD_xgb_model <- xgb.train(
+  params = params,
+  data = train_matrix,
+  nrounds = 10000,                  # Maximum number of trees
+  early_stopping_rounds = 50,       # Stop if no improvement after 50 rounds
+  watchlist = list(train = train_matrix, test = test_matrix),
+  nthread = parallel::detectCores(), # Use all CPU cores
+  verbose = TRUE                     # Print progress
+)
+
+# Generate predictions on the test set
+test_predictions <- predict(VPD_xgb_model, newdata = test_matrix)
+
+# Add predictions to the test dataset
+test_results <- test_df %>%
+  mutate(Predicted = test_predictions)
+
+# Fit a linear model between actual and predicted values
+lm_model <- lm(test_df[, target_cols] ~ Predicted, data = test_results)
+
+r_squared <- summary(lm_model)$r.squared
+r_squared
+
+# 0.915
+
+importance_matrix <- xgb.importance(colnames(VPD_xgb_model$feature_names), model = VPD_xgb_model)
+print(importance_matrix)
+
+
+##SPTAIL PRED 
+
+#Order raster stack to match variables in matrix input into the model - i.e. the same as ...
+#feature_cols <- c(20, 30:41, 44, 45, 48, 50, 52, 53:61)
+#
+data.frame(colnames(merged_df))
+
+raster_stack <- raster::stack("F:/Marsh/P/predblock/P2/standardized/Hour.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ProCurv.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Convergenc.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ChanNetDis.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ChanNetBas.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Aspect.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ValleyDept.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/TotCatchAr.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/TopoWetnes.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Slope.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/RelSlopePo.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_solrad.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/soil_temperature_level_1.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/total_precipitation_hourly.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/volumetric_soil_water_layer_1.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_ELE.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_HLI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_TRI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_TPI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_ELE.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_HLI.tif")
+
+# Retrieve expected feature names from model
+model_feature_names <- AT_xgb_model$feature_names
+print(names(raster_stack))
+# Rename and reorder raster layers to match expected feature names
+names(raster_stack) <- model_feature_names
+
+# Before renaming/reordering
+print(paste("Model expects:", length(model_feature_names), "features"))
+print(paste("Raster has:", names(raster_stack), "layers"))
+print(setdiff(model_feature_names, names(raster_stack))) # Check for mismatched names
+
+raster_stack <- raster_stack[[model_feature_names]]
+# Convert raster stack to matrix and create DMatrix
+
+terra_raster <- rast(raster_stack)
+terra_matrix <- as.matrix(terra_raster) 
+raster_dmatrix <- xgb.DMatrix(data = terra_matrix)
+
+# Predict using trained XGBoost model
+predictions <- predict(AT_xgb_model, newdata = raster_dmatrix)
+# Map predictions back to raster format
+predicted_raster <- setValues(raster::raster(raster_stack), predictions)
+#plot(predicted_raster)
+
+writeRaster(predicted_raster, "F:/Marsh/P/AT_2pm_July_2023_new_solrad4.tif", format = "GTiff" )
+
+save(VPD_xgb_model, file = "F:/Marsh/VPD_Model")
+
+####
+# Specify feature and target columns
+data.frame(colnames(train_df))
+
+feature_cols <- c(20,30:41,44,48,52,53,54:59)
+target_cols <- c(13)
+
+# Define XGBoost parameters
+params <- list(
+  objective = "reg:squarederror",  # Regression problem
+  booster = "gbtree",
+  eta = 0.05,                      # Learning rate
+  max_depth = 5,                   # Equivalent to tree complexity in gbm.step
+  subsample = 0.7,                 # Similar to bag.fraction
+  colsample_bytree = 0.9,# Fraction of features used per tree
+  eval_metric = "rmse")             # Root Mean Squared Error for evaluation
+
+
+# Function to train model and generate results for a single target column
+
+# Create training matrix
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_df[, feature_cols]),  # Select only feature columns
+  label = train_df[, target_cols])
+
+# Create test matrix
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_df[, feature_cols]),  # Select only feature columns
+  label = test_df[, target_cols]              # Use specified column as the target
+)
+
+# Train the model with early stopping
+
+SM_xgb_model <- xgb.train(
+  params = params,
+  data = train_matrix,
+  nrounds = 10000,                  # Maximum number of trees
+  early_stopping_rounds = 50,       # Stop if no improvement after 50 rounds
+  watchlist = list(train = train_matrix, test = test_matrix),
+  nthread = parallel::detectCores(), # Use all CPU cores
+  verbose = TRUE                     # Print progress
+)
+
+# Generate predictions on the test set
+test_predictions <- predict(SM_xgb_model, newdata = test_matrix)
+
+# Add predictions to the test dataset
+test_results <- test_df %>%
+  mutate(Predicted = test_predictions)
+
+# Fit a linear model between actual and predicted values
+lm_model <- lm(test_df[, target_cols] ~ Predicted, data = test_results)
+r_squared <- summary(lm_model)$r.squared
+r_squared
+
+importance_matrix <- xgb.importance(colnames(SM_xgb_model$feature_names), model = SM_xgb_model)
+print(importance_matrix)
+
+save(VPD_xgb_model, file = "F:/Marsh/VPD_Model.json")
+save(VPD_xgb_model, file = "F:/Marsh/VPD_Model.ubj")
+
+save(SM_xgb_model, file = "F:/Marsh/SM_Model.json")
+save(SM_xgb_model, file = "F:/Marsh/SM_Model.ubj")
+
+
+#Order raster stack to match variables in matrix input into the model - i.e. the same as ...
+#feature_cols <- c(20, 30:41, 44, 45, 48, 50, 52, 53:61)
+#
+data.frame(colnames(merged_df))
+
+raster_stack <- raster::stack("F:/Marsh/P/predblock/P2/standardized/Hour.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ProCurv.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Convergenc.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ChanNetDis.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ChanNetBas.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Aspect.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ValleyDept.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/TotCatchAr.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/TopoWetnes.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Slope.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/RelSlopePo.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_solrad.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/soil_temperature_level_1.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/total_precipitation_hourly.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/volumetric_soil_water_layer_1.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_ELE.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_HLI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_TRI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_TPI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_ELE.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_HLI.tif")
+
+# Retrieve expected feature names from model
+model_feature_names <- SM_xgb_model$feature_names
+print(names(raster_stack))
+# Rename and reorder raster layers to match expected feature names
+names(raster_stack) <- model_feature_names
+
+# Before renaming/reordering
+print(paste("Model expects:", length(model_feature_names), "features"))
+print(paste("Raster has:", names(raster_stack), "layers"))
+print(setdiff(model_feature_names, names(raster_stack))) # Check for mismatched names
+
+raster_stack <- raster_stack[[model_feature_names]]
+# Convert raster stack to matrix and create DMatrix
+
+terra_raster <- terra::rast(raster_stack)
+terra_matrix <- as.matrix(terra_raster) 
+raster_dmatrix <- xgb.DMatrix(data = terra_matrix)
+
+
+# Predict using trained XGBoost model - will take a while 
+predictions <- predict(SM_xgb_model, newdata = raster_dmatrix)
+# Map predictions back to raster format
+predicted_raster <- raster::setValues(raster::raster(terra_raster), predictions)
+#plot(predicted_raster)
+
+raster::writeRaster(predicted_raster, "F:/Marsh/P/SM_2pm_July_2023_new_solrad3.tif", format = "GTiff" )
+
+save(SM_xgb_model, file = "...")
+
+###
+###
+
+data.frame(colnames(train_df))
+summary(train_df)
+
+feature_cols <- c(19,30:39,41,43,47,48:54)
+target_cols <- c(10)
+
+# Define XGBoost parameters
+params <- list(
+  objective = "reg:squarederror",  # Regression problem
+  booster = "gbtree",
+  eta = 0.05,                      # Learning rate
+  max_depth = 5,                   # Equivalent to tree complexity in gbm.step
+  subsample = 0.7,                 # Similar to bag.fraction
+  colsample_bytree = 0.9,# Fraction of features used per tree
+  eval_metric = "rmse")             # Root Mean Squared Error for evaluation
+
+
+# Function to train model and generate results for a single target column
+
+# Create training matrix
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_df[, feature_cols]),  # Select only feature columns
+  label = train_df[, target_cols])
+
+# Create test matrix
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_df[, feature_cols]),  # Select only feature columns
+  label = test_df[, target_cols]              # Use specified column as the target
+)
+
+# Train the model with early stopping
+
+RH_xgb_model <- xgb.train(
+  params = params,
+  data = train_matrix,
+  nrounds = 10000,                  # Maximum number of trees
+  early_stopping_rounds = 50,       # Stop if no improvement after 50 rounds
+  watchlist = list(train = train_matrix, test = test_matrix),
+  nthread = parallel::detectCores(), # Use all CPU cores
+  verbose = TRUE                     # Print progress
+)
+
+# Generate predictions on the test set
+test_predictions <- predict(RH_xgb_model, newdata = test_matrix)
+
+# Add predictions to the test dataset
+test_results <- test_df %>%
+  mutate(Predicted = test_predictions)
+
+# Fit a linear model between actual and predicted values
+lm_model <- lm(test_df[, target_cols] ~ Predicted, data = test_results)
+r_squared <- summary(lm_model)$r.squared
+r_squared
+
+save(SM_xgb_model, file = "F:/Marsh/SM_Model.ubj")
+
+#Order raster stack to match variables in matrix input into the model - i.e. the same as ...
+#feature_cols <- c(20, 30:41, 44, 45, 48, 50, 52, 53:61)
+#
+data.frame(colnames(merged_df))
+
+raster_stack <- raster::stack("F:/Marsh/P/predblock/P2/standardized/Hour.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ProCurv.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Convergenc.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ChanNetDis.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ChanNetBas.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Aspect.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/ValleyDept.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/TotCatchAr.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/TopoWetnes.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/Slope.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/RelSlopePo.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_solrad.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/soil_temperature_level_1.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/total_precipitation_hourly.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/volumetric_soil_water_layer_1.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_ELE.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_HLI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_TRI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/DEM_TPI.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_ELE.tif",
+                              "F:/Marsh/P/predblock/P2/standardized/UAS_HLI.tif")
+
+
+# Retrieve expected feature names from model
+model_feature_names <- RH_xgb_model$feature_names
+print(names(raster_stack))
+# Rename and reorder raster layers to match expected feature names
+names(raster_stack) <- model_feature_names
+
+# Before renaming/reordering
+print(paste("Model expects:", length(model_feature_names), "features"))
+print(paste("Raster has:", names(raster_stack), "layers"))
+print(setdiff(model_feature_names, names(raster_stack))) # Check for mismatched names
+
+raster_stack <- raster_stack[[model_feature_names]]
+# Convert raster stack to matrix and create DMatrix
+
+terra_raster <- terra::rast(raster_stack)
+terra_matrix <- as.matrix(terra_raster) 
+raster_dmatrix <- xgb.DMatrix(data = terra_matrix)
+
+
+# Predict using trained XGBoost model - will take a while 
+predictions <- predict(RH_xgb_model, newdata = raster_dmatrix)
+# Map predictions back to raster format
+predicted_raster <- raster::setValues(raster::raster(terra_raster), predictions)
+#plot(predicted_raster)
+
+importance_matrix <- xgb.importance(colnames(RH_xgb_model$feature_names), model = RH_xgb_model)
+print(importance_matrix)
+
+raster::writeRaster(predicted_raster, "F:/Marsh/P/RH_2pm_July_2023_new_solrad3.tif", format = "GTiff" )
+
+
