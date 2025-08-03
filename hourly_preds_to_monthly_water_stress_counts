@@ -1,0 +1,47 @@
+# Set directories
+
+vpd_dir <- "F:/Marsh/J/VPD_predictions"
+sm_dir  <- "F:/Marsh/J/SM_predictions"
+
+# List .tif files for each variable
+vpd_files <- list.files(vpd_dir, pattern = "^VPD_\\d{8}_\\d{4}\\.tif$", full.names = TRUE)
+sm_files  <- list.files(sm_dir,  pattern = "^SM_\\d{8}_\\d{4}\\.tif$",  full.names = TRUE)
+
+# Helper to extract datetime part from filename
+extract_datetime <- function(fname) {
+  dt_str <- str_extract(basename(fname), [/d%7b8%7d_/d%7b4%7d]\\d{8}_\\d{4})
+  as.POSIXct(dt_str, format = "%Y%m%d_%H%M", tz = "UTC")
+  }
+
+
+# Extract datetimes
+vpd_datetimes <- sapply(vpd_files, extract_datetime)
+sm_datetimes  <- sapply(sm_files, extract_datetime)
+
+# Find common date/times (matching hours)
+common_dt <- intersect(vpd_datetimes, sm_datetimes)
+
+# Subset file vectors to matching dates, in order
+vpd_files_common <- vpd_files[vpd_datetimes %in% common_dt]
+sm_files_common  <- sm_files[sm_datetimes %in% common_dt]
+ordered_idx      <- order(sapply(vpd_files_common, extract_datetime))
+vpd_files_common <- vpd_files_common[ordered_idx]
+sm_files_common  <- sm_files_common[ordered_idx]
+
+# Initialize result raster with zeros -- assumes same grid for all files
+template_raster <- raster(vpd_files_common[1])
+count_raster <- raster(template_raster)
+values(count_raster) <- 0
+
+
+# Main loop: For each matching hour, increment count where conditions are met
+for (i in seq_along(vpd_files_common)) {
+    vpd_r <- raster(vpd_files_common[i])
+  sm_r  <- raster(sm_files_common[i])
+    mask  <- (values(vpd_r) > 3) & (values(sm_r) < 450)
+  values(count_raster)[mask] <- values(count_raster)[mask] + 1
+  }
+
+# Write the output raster
+output_file <- "F:/Marsh/J/VPD_SM_condition_counts.tif"
+writeRaster(count_raster, output_file, format="GTiff", overwrite=TRUE)
