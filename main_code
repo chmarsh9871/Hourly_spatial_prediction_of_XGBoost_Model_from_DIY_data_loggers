@@ -1,0 +1,105 @@
+dates_to_process <- seq.Date(as.Date("2023-05-15"), as.Date("2023-09-30"), by = "day")
+hours_to_predict <- 10:17  # 10am to 5pm
+temp_dir <- "F:/Marsh/P/TEMP"
+static_dir <- "F:/Marsh/P/static_s/"
+dynamic_dir_root <- "F:/Marsh/P/dynamic_s"
+solrad_dir <- "F:/Marsh/P/solrad_s"
+output_dir <- "F:/Marsh/P/VPD_predictions"
+dir.create(temp_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+static_vars <- c(
+  "ProCurv","PlanCurv","LS.Factor",
+  "Convergenc","ChanNetDis","ChanNetBas","Aspect",                       
+  "ValleyDept","TotCatchAr","TopoWetnes","Slope",                        
+  "RelSlopePo",   
+  "DEM_ELE","DEM_HLI","DEM_TRI",                      
+  "DEM_TPI","UAS_ELE","UAS_HLI","UAS_TRI",                      
+  "UAS_TPI"  )
+
+static_paths <- file.path(static_dir, paste0(static_vars, ".tif"))
+names(static_paths) <- static_vars
+
+dynamic_vars <- c("Hour", "soil_temperature_level_1", "total_precipitation_hourly", "volumetric_soil_water_layer_1")
+
+model_feature_names <- c(
+  "Hour","ProCurv","PlanCurv","LS.Factor",
+  "Convergenc","ChanNetDis","ChanNetBas","Aspect",                       
+  "ValleyDept","TotCatchAr","TopoWetnes","Slope",                        
+  "RelSlopePo", "UAS_solrad", "soil_temperature_level_1", "total_precipitation_hourly",   
+   "volumetric_soil_water_layer_1", "DEM_ELE","DEM_HLI","DEM_TRI",                      
+   "DEM_TPI","UAS_ELE","UAS_HLI","UAS_TRI",                      
+   "UAS_TPI"  
+)
+
+get_solrad_path <- function(date, hour) {
+  date <- as.Date(date)
+  month_name <- format(date, "%b")
+  hour_txt <- ifelse(hour < 12, paste0(hour, "am"),
+                     ifelse(hour == 12, "12pm", paste0(hour - 12, "pm")))
+  file.path(solrad_dir, sprintf("P_%s_%s.tif", month_name, hour_txt))
+}
+
+for (this_date in dates_to_process) {
+  for (this_hour in hours_to_predict) {
+    date_obj <- as.Date(this_date)
+    year_str  <- format(date_obj, "%Y")
+    month_str <- format(date_obj, "%m")
+    day_str   <- format(date_obj, "%d")
+    hour_str  <- sprintf("%02d", this_hour)
+    dyn_dir <- file.path(dynamic_dir_root, year_str, month_str, day_str, hour_str)
+    
+    skip_this <- FALSE
+    dynamic_files <- list()
+    for (v in dynamic_vars) {
+      src <- file.path(dyn_dir, paste0(v, ".tif"))
+      dest <- file.path(temp_dir, paste0(v, ".tif"))
+      if (!file.exists(src)) {
+        warning(sprintf("Missing dynamic file: %s for %s %s:00", src, this_date, this_hour))
+        skip_this <- TRUE; break
+      }
+      file_copy(src, dest, overwrite=TRUE)
+      dynamic_files[[v]] <- dest
+    }
+    if (skip_this) next
+    
+    solrad_src <- get_solrad_path(date_obj, this_hour)
+    solrad_dest <- file.path(temp_dir, "UAS_solrad.tif")
+    if (!file.exists(solrad_src)) {
+      warning(sprintf("Missing UAS_solrad: %s for %s %s:00", solrad_src, this_date, this_hour))
+      next
+    }
+    file_copy(solrad_src, solrad_dest, overwrite=TRUE)
+    
+    all_files <- c(
+      dynamic_files["Hour"],
+      static_paths,
+      UAS_solrad = solrad_dest,
+      dynamic_files[c("soil_temperature_level_1", "total_precipitation_hourly", "volumetric_soil_water_layer_1")]
+    )
+    all_files <- unlist(all_files)[model_feature_names]
+    
+    # align before stack
+    template_raster <- raster(static_paths[1])
+    aligned_rasters <- lapply(all_files, function(f) {
+      r <- raster(f)
+      if (!compareRaster(r, template_raster, extent=TRUE, rowcol=TRUE, crs=TRUE, res=TRUE, stopiffalse=FALSE)) {
+        r <- raster::resample(r, template_raster, method="bilinear")
+      }
+      return(r)
+    })
+    
+    raster_stack <- stack(aligned_rasters)
+    names(raster_stack) <- model_feature_names
+    terra_raster <- rast(raster_stack)
+    terra_matrix <- as.matrix(terra_raster)
+    raster_dmatrix <- xgb.DMatrix(terra_matrix)
+    predictions <- predict(VPD_xgb_model, newdata = raster_dmatrix)
+    predicted_raster <- setValues(raster::raster(raster_stack), predictions)
+    
+    outname <- sprintf("VPD_%s_%02d00.tif", format(date_obj, "%Y%m%d"), this_hour)
+    outfile <- file.path(output_dir, outname)
+    writeRaster(predicted_raster, outfile, format = "GTiff", overwrite=TRUE)
+    message(sprintf("✅ Predicted and wrote %s %02d:00 -> %s", date_obj, this_hour, outfile))
+  }
+}
