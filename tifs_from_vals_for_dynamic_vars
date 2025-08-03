@@ -1,0 +1,91 @@
+library(terra)
+library(lubridate)
+library(dplyr)
+
+# Filter to just 'J' site
+df_P <- dplyr::filter(merged_df, Site.y == "P")
+
+# Robustly process datetime unique values
+all_times_raw <- unique(df_P$DateTimeH)
+
+# Parse as POSIXct, handling both date+time and date-only
+all_times_parsed <- suppressWarnings(ymd_hms(all_times_raw, quiet = TRUE))
+missing_time <- is.na(all_times_parsed)
+
+if (any(missing_time)) {
+  # Try to parse as date (gets hour==0)
+    all_times_parsed[missing_time] <- suppressWarnings(ymd(all_times_raw[missing_time]))
+}
+
+# Remove failed parses
+all_times_parsed <- all_times_parsed[!is.na(all_times_parsed)]
+
+# Filter for time window: only 10:00 - 17:00 inclusive
+all_times <- all_times_parsed[hour(all_times_parsed) >= 10 & hour(all_times_parsed) <= 17]
+
+n_times <- length(all_times)
+
+sample_raster <- rast("F:/Marsh/P/static_s/standardized/UAS_HLI.tif")
+target_crs <- crs(sample_raster)
+target_extent <- ext(sample_raster)
+target_res <- res(sample_raster)
+
+vars <- c("Hour", "soil_temperature_level_1",
+                    "total_precipitation_hourly",
+                    "volumetric_soil_water_layer_1")
+
+output_dir <- "F:/Marsh/J/dynamic_s2"
+
+n_vars <- length(vars)
+counter <- 1
+
+# Ensure df_J DateTimeH is also POSIXct for reliable matching
+dt_parsed <- suppressWarnings(ymd_hms(df_J$DateTimeH, quiet = TRUE))
+missing_time <- is.na(dt_parsed)
+
+if (any(missing_time)) {
+  dt_parsed[missing_time] <- suppressWarnings(ymd(df_J$DateTimeH[missing_time]))
+  }
+
+df_J$DateTimeH_parsed <- dt_parsed
+
+for (dt in all_times) {
+  df_sub <- df_J[df_J$DateTimeH_parsed == dt, ]
+    year_ <- year(dt)
+    month_ <- sprintf("%02d", month(dt))
+  day_ <- sprintf("%02d", day(dt))
+  hour_ <- sprintf("%02d", hour(dt))
+  dir_path <- file.path(output_dir, year_, month_, day_, hour_)
+  dir.create(dir_path, recursive = TRUE, showWarnings = FALSE)
+  
+  for (v in vars) {
+    # Check if the variable exists and is not all NA for this time step
+    if (!v %in% names(df_sub)) next
+        vals <- df_sub[[v]]
+    vals <- vals[!is.na(vals)]
+        if (length(vals) == 0) next
+    
+    
+        # Use mean value for this variable and time step
+        val <- mean(vals)
+    
+        # Create a raster filled with this value, matching the sample raster's dimensions, crs, extent, res
+    r <- rast(nrows = nrow(sample_raster), ncols = ncol(sample_raster),
+              ext = target_extent, crs = target_crs)
+        res(r) <- target_res
+        values(r) <- val
+    
+        # Save raster
+        fpath <- file.path(dir_path, paste0(v, ".tif"))
+        writeRaster(r, fpath, overwrite = TRUE)
+    
+        # Progress tracker
+        cat(sprintf("[%d/%d] Processed %s %s: saved to %s\n",
+                                counter, n_times * n_vars,
+                                as.character(dt), v, fpath))
+        counter <- counter + 1
+      }
+  }
+
+
+
